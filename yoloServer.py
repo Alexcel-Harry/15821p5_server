@@ -51,19 +51,37 @@ class EchoEngine(cognitive_engine.Engine):
 
         img_data = input_frame.payloads[0]
         np_data = np.frombuffer(img_data, dtype=np.uint8)
-        
+        # with open("a.txt", "w") as f:
+        #    f.write("BYTESTRING::::\n")
+        #    f.write(img_data.decode())
+        # exit()
         img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
 
         results = self.model(img)
+        print("Start of Debug Msg")
+        #print(results)
+        #with open ('a.txt', "w") as f:
+            #f.write(str(results))
+        resultTextString = ''
+        #with open ('b.txt', 'w') as f:
+        for box in results[0].boxes:
+            #print(str(box))
+            classID = int(box.cls[0])
+            cords = box.xywhn[0].tolist()
+            conf = float(box.conf[0])
+            resultTextString += f'{cords[0]},{cords[1]},{cords[2]},{cords[3]},{classID},{conf};'
+                #f.write(str([classID, cords, conf]))
+            #f.write(str(results))
 
-        annotated_img = results[0].plot()
+        #annotated_img = results[0].plot()
 
-        _, buffer = cv2.imencode(".jpg", annotated_img)
-        annotated_bytes = buffer.tobytes()
-
+        #_, buffer = cv2.imencode(".jpg", annotated_img)
+        #annotated_bytes = buffer.tobytes()
         result = gabriel_pb2.ResultWrapper.Result()
-        result.payload_type = gabriel_pb2.PayloadType.IMAGE
-        result.payload = annotated_bytes
+        #result.payload_type = gabriel_pb2.PayloadType.IMAGE
+        result.payload_type = gabriel_pb2.PayloadType.TEXT
+        result.payload = resultTextString.encode('utf-8')
+        #result.payload = annotated_bytes
         result_wrapper.results.append(result)
 
         from datetime import datetime
@@ -73,7 +91,8 @@ class EchoEngine(cognitive_engine.Engine):
         ack.payload_type = gabriel_pb2.PayloadType.TEXT
         ack.payload = f"ACK at {ts}".encode("utf-8")
         result_wrapper.results.append(ack)
-
+        print(resultTextString)
+        #exit()
         return result_wrapper
 
 
