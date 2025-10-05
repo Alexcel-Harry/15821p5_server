@@ -2,9 +2,7 @@
 """
 Echo Engine based on Gabriel
 
-Functions:
-    - Receives input frames from client
-    - Echoes payloads back with ACK
+Modified to support GPU (CUDA) if available.
 """
 
 import argparse
@@ -13,6 +11,7 @@ import io
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import torch
 
 from gabriel_server import cognitive_engine
 from gabriel_server import local_engine
@@ -25,19 +24,57 @@ NUM_TOKENS = 1
 
 
 class EchoEngine(cognitive_engine.Engine):
-    def __init__(self):
-        """
-        Perform startup operations such as warming up the model.
-        Nothing to do here for echo server.
-        """
+    def __init__(self, device=None, use_half=False):
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            if ("cuda" in device) and (not torch.cuda.is_available()):
+                logging.warning("Requested CUDA device but torch.cuda.is_available() is False. Falling back to CPU.")
+                self.device = "cpu"
+            else:
+                self.device = device
+
+        logging.info(f"Using device: {self.device}")
+
+        if "cuda" in self.device:
+            torch.backends.cudnn.benchmark = True
+
         logging.info("Loading YOLO model...")
         self.model = YOLO("yolo11n.pt")
+
+        # set the model to float 16 or float 32 
+        try:
+            self.model.to(self.device)
+            self.model.eval() 
+            self.use_half = use_half and ("cuda" in self.device)
+            if self.use_half:
+                logging.info("Switching model to half precision (fp16).")
+                try:
+                    try:
+                        self.model.model.half()
+                    except Exception:
+                        self.model.half()
+                except Exception:
+                    logging.warning("Couldn't switch to half precision; continuing with full precision.")
+                    self.use_half = False
+
+            # warm up
+            try:
+                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+                with torch.no_grad():
+                    self.model(dummy, device=self.device)
+            except Exception:
+                # ignore warmup errors
+                pass
+
+        except Exception as e:
+            logging.exception("Failed to move model to device; continuing on CPU.")
+            self.device = "cpu"
+            self.use_half = False
+
         logging.info("YOLO model loaded.")
 
     def handle(self, input_frame):
-        """
-        Process the input frame and return processing results.
-        """
         status = gabriel_pb2.ResultWrapper.Status.SUCCESS
         result_wrapper = cognitive_engine.create_result_wrapper(status)
 
@@ -48,67 +85,56 @@ class EchoEngine(cognitive_engine.Engine):
         if input_frame.payload_type != gabriel_pb2.PayloadType.IMAGE:
             status = gabriel_pb2.ResultWrapper.Status.WRONG_INPUT_FORMAT
             return cognitive_engine.create_result_wrapper(status)
-
         img_data = input_frame.payloads[0]
         np_data = np.frombuffer(img_data, dtype=np.uint8)
-        # with open("a.txt", "w") as f:
-        #    f.write("BYTESTRING::::\n")
-        #    f.write(img_data.decode())
-        # exit()
         img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
+        try:
+            with torch.no_grad():
+                results = self.model(img, device=self.device)
+        except Exception as e:
+            logging.exception("Inference failed")
+            status = gabriel_pb2.ResultWrapper.Status.GENERIC_ERROR
+            return cognitive_engine.create_result_wrapper(status)
 
-        results = self.model(img)
-        print("Start of Debug Msg")
-        #print(results)
-        #with open ('a.txt', "w") as f:
-            #f.write(str(results))
         resultTextString = ''
-        #with open ('b.txt', 'w') as f:
         for box in results[0].boxes:
-            #print(str(box))
             classID = int(box.cls[0])
             cords = box.xywhn[0].tolist()
             conf = float(box.conf[0])
             resultTextString += f'{cords[0]},{cords[1]},{cords[2]},{cords[3]},{classID},{conf};'
-                #f.write(str([classID, cords, conf]))
-            #f.write(str(results))
 
-        #annotated_img = results[0].plot()
-
-        #_, buffer = cv2.imencode(".jpg", annotated_img)
-        #annotated_bytes = buffer.tobytes()
         result = gabriel_pb2.ResultWrapper.Result()
-        #result.payload_type = gabriel_pb2.PayloadType.IMAGE
         result.payload_type = gabriel_pb2.PayloadType.TEXT
         result.payload = resultTextString.encode('utf-8')
-        #result.payload = annotated_bytes
         result_wrapper.results.append(result)
 
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        ack = gabriel_pb2.ResultWrapper.Result()
-        ack.payload_type = gabriel_pb2.PayloadType.TEXT
-        ack.payload = f"ACK at {ts}".encode("utf-8")
-        result_wrapper.results.append(ack)
-        print(resultTextString)
-        #exit()
-        return result_wrapper
+        # from datetime import datetime
+        # ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # ack = gabriel_pb2.ResultWrapper.Result()
+        # ack.payload_type = gabriel_pb2.PayloadType.TEXT
+        # ack.payload = f"ACK at {ts}".encode("utf-8")
+        # result_wrapper.results.append(ack)
+
+        return result_wrapper
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT)
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--device", type=str, default=None,
+                        help='device to use, e.g. "cuda", "cuda:0", or "cpu". If omitted, auto-detect.')
+    parser.add_argument("--half", action="store_true", help="use fp16 half precision on CUDA device")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
     def engine_factory():
-        return EchoEngine()
+        return EchoEngine(device=args.device, use_half=args.half)
 
     local_engine.run(engine_factory, SOURCE_NAME, INPUT_QUEUE_MAXSIZE, args.port, NUM_TOKENS)
 
 
 if __name__ == "__main__":
     main()
+
