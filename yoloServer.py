@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import torch
+import time
+from turbojpeg import TurboJPEG
 
 from gabriel_server import cognitive_engine
 from gabriel_server import local_engine
@@ -20,7 +22,7 @@ from gabriel_protocol import gabriel_pb2
 SOURCE_NAME = "echo"
 INPUT_QUEUE_MAXSIZE = 60
 DEFAULT_PORT = 9099
-NUM_TOKENS = 1
+NUM_TOKENS = 3
 
 
 class EchoEngine(cognitive_engine.Engine):
@@ -40,7 +42,7 @@ class EchoEngine(cognitive_engine.Engine):
             torch.backends.cudnn.benchmark = True
 
         logging.info("Loading YOLO model...")
-        self.model = YOLO("yolo11n.pt")
+        self.model = YOLO("yolo11s.pt")
 
         # set the model to float 16 or float 32 
         try:
@@ -60,12 +62,17 @@ class EchoEngine(cognitive_engine.Engine):
 
             # warm up
             try:
-                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+                dummy = np.zeros((640, 480, 3), dtype=np.uint8)
                 with torch.no_grad():
                     self.model(dummy, device=self.device)
             except Exception:
                 # ignore warmup errors
                 pass
+            
+            try: 
+                self.jpeg = TurbeJPEG()
+            except Exception:
+                self.jpeg = None
 
         except Exception as e:
             logging.exception("Failed to move model to device; continuing on CPU.")
@@ -74,6 +81,102 @@ class EchoEngine(cognitive_engine.Engine):
 
         logging.info("YOLO model loaded.")
 
+    def handle_useless(self, input_frame):
+            status = gabriel_pb2.ResultWrapper.Status.SUCCESS
+            result_wrapper = cognitive_engine.create_result_wrapper(status)
+    
+            if len(input_frame.payloads) == 0:
+                logging.info("Empty payloads.")
+                return result_wrapper
+    
+            # Start timer
+            t0 = time.time()
+    
+            if input_frame.payload_type != gabriel_pb2.PayloadType.IMAGE:
+                status = gabriel_pb2.ResultWrapper.Status.WRONG_INPUT_FORMAT
+                return cognitive_engine.create_result_wrapper(status)
+    
+            img_data = input_frame.payloads[0]
+            np_data = np.frombuffer(img_data, dtype=np.uint8)
+            img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)  # BGR np.uint8 H W C
+    
+            try:
+                # The ONLY call you need. It handles pre-processing, inference, 
+                # and post-processing automatically on the correct device.
+                results = self.model(img)
+    
+            except Exception as e:
+                logging.exception("Inference failed")
+                status = gabriel_pb2.ResultWrapper.Status.GENERIC_ERROR
+                return cognitive_engine.create_result_wrapper(status)
+    
+            resultTextString = ''
+            if results:
+                for box in results[0].boxes:
+                    classID = int(box.cls[0])
+                    cords = box.xywhn[0].tolist()
+                    conf = float(box.conf[0])
+                    resultTextString += f'{cords[0]},{cords[1]},{cords[2]},{cords[3]},{classID},{conf};'
+    
+            result = gabriel_pb2.ResultWrapper.Result()
+            result.payload_type = gabriel_pb2.PayloadType.TEXT
+            result.payload = resultTextString.encode('utf-8')
+            result_wrapper.results.append(result)
+            
+            # End timer
+            t1 = time.time()
+            print(f"handle time {t1 - t0}")
+    
+            return result_wrapper
+
+   
+#     def handle(self, input_frame):
+#         status = gabriel_pb2.ResultWrapper.Status.SUCCESS
+#         result_wrapper = cognitive_engine.create_result_wrapper(status)
+#     
+#         if len(input_frame.payloads) == 0:
+#             logging.info("Empty payloads.")
+#             return result_wrapper
+#         
+#         t0 = time.time()
+# 
+#         if input_frame.payload_type != gabriel_pb2.PayloadType.IMAGE:
+#             status = gabriel_pb2.ResultWrapper.Status.WRONG_INPUT_FORMAT
+#             return cognitive_engine.create_result_wrapper(status)
+#     
+#         img_data = input_frame.payloads[0]
+#         if self.jpeg is not None:
+#             img = self.jpeg.decode(img_data)
+#         else: 
+#             np_data = np.frombuffer(img_data, dtype=np.uint8)
+#             img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)  # BGR np.uint8 H W C
+#     
+#         try:
+#             with torch.no_grad():
+#                 results = self.model(img, conf=0.1)  # wrapper，但不带 device 参数
+#         except Exception:
+#             results = None
+#     
+#         resultTextString = ''
+#         if results is not None:
+#             for box in results[0].boxes:
+#                 classID = int(box.cls[0])
+#                 cords = box.xywhn[0].tolist()
+#                 conf = float(box.conf[0])
+#                 resultTextString += f'{cords[0]},{cords[1]},{cords[2]},{cords[3]},{classID},{conf};'
+#         else:
+#             pass
+#     
+#         result = gabriel_pb2.ResultWrapper.Result()
+#         result.payload_type = gabriel_pb2.PayloadType.TEXT
+#         result.payload = resultTextString.encode('utf-8')
+#         result_wrapper.results.append(result)
+#    
+# 
+#         t1 = time.time()
+#         print(f"handle time {t1 - t0}")
+#         return result_wrapper
+# 
     def handle(self, input_frame):
         status = gabriel_pb2.ResultWrapper.Status.SUCCESS
         result_wrapper = cognitive_engine.create_result_wrapper(status)
@@ -90,7 +193,7 @@ class EchoEngine(cognitive_engine.Engine):
         img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
         try:
             with torch.no_grad():
-                results = self.model(img, device=self.device)
+                results = self.model(img)
         except Exception as e:
             logging.exception("Inference failed")
             status = gabriel_pb2.ResultWrapper.Status.GENERIC_ERROR
